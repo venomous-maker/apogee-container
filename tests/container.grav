@@ -1,0 +1,165 @@
+// apogee-container's tests: lifetimes, autowiring through interfaces,
+// contextual bindings, extenders and hooks, tags, method injection, scopes,
+// cycle and missing-binding errors, and singletons under many threads.
+import "std"
+import "../src/container.grav"
+use apogee.*
+
+interface Clock { fn now() -> long }
+class FixedClock implements Clock {
+    public at: long
+    constructor() { self.at = 1000 }
+    fn now() -> long { return self.at }
+}
+class OtherClock implements Clock { fn now() -> long { return 7 } }
+
+interface Store { fn name() -> string }
+class MemoryStore implements Store { fn name() -> string { return "memory" } }
+
+// Autowired: its constructor's Clock and Store come from the container.
+@Service class Auditor {
+    public clock: Clock
+    public store: Store
+    constructor(clock: Clock, store: Store) { self.clock = clock; self.store = store; }
+}
+// Two constructors: the one with the most resolvable parameters wins.
+class Reporter extends Auditor {
+    public extra: string = ""
+    constructor(clock: Clock, store: Store) { super(clock, store); self.extra = "two"; }
+    constructor(clock: Clock) { super(clock, new MemoryStore()); self.extra = "one"; }
+}
+// Needs a number: not autowirable unless bound by hand.
+class Port { public n: int  constructor(n: int) { self.n = n } }
+class NeedsPort { public p: Port  constructor(p: Port) { self.p = p } }
+// A cycle: A needs B needs A.
+class CycleA { constructor(b: CycleB) {} }
+class CycleB { constructor(a: CycleA) {} }
+
+class Counter { public n: int = 0 }
+@Controller class Greeter {
+    fn greet(clock: Clock, name: string, times: int) -> string { return "hi ${name} x${times} at ${clock.now()}"; }
+}
+
+fn base() -> Container {
+    let c = new Container();
+    c.bindClass::<Clock, FixedClock>();
+    c.singletonClass::<Store, MemoryStore>();
+    c.register::<Auditor>();
+    c.register::<Reporter>();
+    return c;
+}
+
+test "lifetimes: transient, singleton, instance, and the container itself" {
+    let c = base();
+    assertEq(c.make::<Clock>() == c.make::<Clock>(), false);      // transient: new each time
+    assertEq(c.make::<Store>() == c.make::<Store>(), true);       // singleton
+    let counter = new Counter();
+    c.instance::<Counter>(counter);
+    assertEq(c.make::<Counter>() == counter, true);
+    assertEq(c.make::<Container>() == c, true);
+    let made = new Array<int>();
+    c.singleton::<Port>(fn(c: Container) -> Port { made.push(1); return new Port(8080); });
+    assertEq(c.make::<Port>().n + c.make::<Port>().n, 16160);
+    assertEq(made.size(), 1);                                      // factory ran once
+}
+
+test "autowiring: constructors wired through interfaces, the widest constructor chosen" {
+    let c = base();
+    let a = c.make::<Auditor>();
+    assertEq("${a.clock.now()} ${a.store.name()}", "1000 memory");
+    let r = c.make::<Reporter>();
+    assertEq(r.extra, "two");
+    // A class nobody registered, but with reflection (its hierarchy has a decorator).
+    let c2 = new Container();
+    c2.bindClass::<Clock, FixedClock>();
+    c2.bindClass::<Store, MemoryStore>();
+    assertEq(c2.make::<Auditor>().store.name(), "memory");
+    // With Store unbound only the one-parameter constructor fits.
+    let c3 = new Container();
+    c3.bindClass::<Clock, FixedClock>();
+    c3.register::<Reporter>();
+    assertEq(c3.make::<Reporter>().extra, "one");
+}
+
+test "contextual bindings, extenders, resolving hooks, aliases, tags" {
+    let c = base();
+    c.when::<Reporter, Clock>(fn(c: Container) -> Clock { return new OtherClock(); });
+    assertEq(c.make::<Reporter>().clock.now(), 7 as long);
+    assertEq(c.make::<Auditor>().clock.now(), 1000 as long);       // others keep the ordinary one
+
+    c.extend::<Clock>(fn(clk: Clock, c: Container) -> Clock { (clk as FixedClock).at = 5; return clk; });
+    assertEq(c.make::<Clock>().now(), 5 as long);
+    let seen = new Array<string>();
+    c.resolving::<Store>(fn(s: Store, c: Container) { seen.push(s.name()); });
+    c.forget::<Store>();
+    c.singletonClass::<Store, MemoryStore>();
+    c.make::<Store>();
+    c.make::<Store>();
+    assertEq(seen.size(), 1);                                      // a singleton is made once
+
+    c.alias("clock", nameof(Clock));
+    assertEq((c.makeNamed("clock") as Clock).now(), 5 as long);
+    c.tag::<Clock>("timers");
+    c.tagNamed(nameof(Store), "timers");
+    assertEq(c.tagged("timers").size(), 2);
+}
+
+test "method injection: classes from the container, the rest in order" {
+    let c = base();
+    let g = new Greeter();
+    let r = c.call(g, "greet", ["ada" as any, 3 as any]);
+    assertEq(r as string, "hi ada x3 at 1000");
+}
+
+test "scopes: scoped values per scope, singletons shared" {
+    let c = base();
+    c.scoped::<Counter>(fn(c: Container) -> Counter { return new Counter(); });
+    let msg = "";
+    try { c.make::<Counter>(); } catch (e: ContainerError) { msg = e.message(); }
+    assertEq(Str.contains(msg, "is scoped"), true);
+    let s1 = c.scope();
+    let s2 = c.scope();
+    assertEq(s1.make::<Counter>() == s1.make::<Counter>(), true);
+    assertEq(s1.make::<Counter>() == s2.make::<Counter>(), false);
+    assertEq(s1.make::<Store>() == s2.make::<Store>(), true);
+    assertEq(s1.make::<Container>() == s1, true);
+}
+
+test "errors: nothing bound, primitives, cycles" {
+    let c = new Container();
+    let msg = "";
+    try { c.make::<Store>(); } catch (e: ContainerError) { msg = e.message(); }
+    assertEq(Str.startsWith(msg, "nothing is bound to Store"), true);
+    msg = "";
+    c.register::<NeedsPort>();
+    c.register::<Port>();
+    try { c.make::<NeedsPort>(); } catch (e: ContainerError) { msg = e.message(); }
+    assertEq(Str.contains(msg, "cannot build Port"), true);
+    c.bind::<Port>(fn(c: Container) -> Port { return new Port(1); });
+    assertEq(c.make::<NeedsPort>().p.n, 1);
+    msg = "";
+    c.register::<CycleA>();
+    c.register::<CycleB>();
+    try { c.make::<CycleA>(); } catch (e: ContainerError) { msg = e.message(); }
+    assertEq(Str.contains(msg, "dependency cycle: CycleA -> CycleB -> CycleA"), true);
+}
+
+test "a singleton is made exactly once however many threads ask at once" {
+    let c = new Container();
+    let made = new AtomicInt(0);
+    c.singleton::<Counter>(fn(c: Container) -> Counter { made.increment(); Time.sleepMs(20); return new Counter(); });
+    let first = new Array<Counter>();
+    let lock = new Mutex();
+    let threads = new Array<Thread>();
+    for (i in 0..8) {
+        threads.push(Thread.spawn(fn() {
+            let x = c.make::<Counter>();
+            lock.lock(); first.push(x); lock.unlock();
+        }));
+    }
+    for (t in threads) { t.join(); }
+    assertEq(made.get(), 1 as long);
+    let same = true;
+    for (x in first) { if (x != first[0]) { same = false; } }
+    assertEq(same, true);
+}
