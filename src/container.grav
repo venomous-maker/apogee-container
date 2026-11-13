@@ -50,6 +50,15 @@ namespace apogee {
         }
     }
 
+    // How to call a method: the key for each parameter the container fills
+    // ("" for one the caller gives).
+    class CallPlan {
+        public method: MethodInfo
+        public keys: Array<string>
+        public types: Array<string>
+        constructor(method: MethodInfo, keys: Array<string>, types: Array<string>) { self.method = method; self.keys = keys; self.types = types; }
+    }
+
     // How to build a class: which constructor, and the key for each parameter.
     class BuildPlan {
         public cls: ClassInfo
@@ -91,6 +100,8 @@ namespace apogee {
         private autowired: HashMap<string, Binding>
         // Shared, never changed: the arguments of a constructor that takes none.
         private noArgs: Array<any>
+        // call()'s plans, by "Class.method".
+        private callPlans: HashMap<string, CallPlan>
         private lock: ReentrantLock
         // ── this container's own ───────────────────────────────────────────────
         // The root container (itself for the root).
@@ -107,6 +118,7 @@ namespace apogee {
             self.contextual = new HashMap<string, fn(Container) -> any>();
             self.autowired = new HashMap<string, Binding>();
             self.noArgs = new Array<any>();
+            self.callPlans = new HashMap<string, CallPlan>();
             self.lock = new ReentrantLock();
             self.root = null;
             self.scopedValues = new HashMap<string, any>();
@@ -245,20 +257,42 @@ namespace apogee {
         fn call(obj: any, method: string, extra: Array<any> = new Array<any>()) -> any {
             let info = ClassInfo.of(obj);
             if (info == null) { throw new ContainerError("call: not an object"); }
+            let plan = self.callPlan(info, method);
+            let args = new Array<any>();
+            args.reserve(plan.keys.size());
+            let next = 0;
+            for (i, k in plan.keys) {
+                if (k != "") { args.push(self.makeNamed(k)); }
+                else if (next < extra.size()) { args.push(extra[next]); next += 1; }
+                else { throw new ContainerError("cannot call " + info.name + "." + method + ": nothing for its " + plan.types[i] + " parameter"); }
+            }
+            return plan.method.invoke(obj, args);
+        }
+        // Which parameters of a method the container fills (their keys) and
+        // which come from the caller (""), worked out once per class and method.
+        private fn callPlan(info: ClassInfo, method: string) -> CallPlan {
+            let t = self.top();
+            let id = info.name + "." + method;
+            t.lock.lock();
+            let known = t.callPlans.getOr(id, null);
+            t.lock.unlock();
+            if (known != null) { return known; }
             if (!info.isReflected()) {
                 throw new ContainerError("call: " + info.name + " has no reflection (name it in reflect(...) or give its hierarchy a decorator)");
             }
             let m = info.method(method);
             if (m == null) { throw new ContainerError(info.name + " has no method '" + method + "'"); }
-            let args = new Array<any>();
-            let next = 0;
-            for (p in Container.splitTypes(m.params)) {
+            let keys = new Array<string>();
+            let types = Container.splitTypes(m.params);
+            for (p in types) {
                 let k = self.keyFor(p);
-                if (k != "" && self.hasNamed(k)) { args.push(self.makeNamed(k)); }
-                else if (next < extra.size()) { args.push(extra[next]); next += 1; }
-                else { throw new ContainerError("cannot call " + info.name + "." + method + ": nothing for its " + p + " parameter"); }
+                keys.push(k != "" && self.hasNamed(k) ? k : "");
             }
-            return m.invoke(obj, args);
+            let plan = new CallPlan(m, keys, types);
+            t.lock.lock();
+            t.callPlans.put(id, plan);
+            t.lock.unlock();
+            return plan;
         }
 
         // ── scopes ─────────────────────────────────────────────────────────────
@@ -272,7 +306,7 @@ namespace apogee {
         constructor(root: Container) {
             self.bindings = root.bindings; self.aliases = root.aliases; self.tags = root.tags;
             self.extenders = root.extenders; self.resolvingHooks = root.resolvingHooks;
-            self.contextual = root.contextual; self.autowired = root.autowired; self.noArgs = root.noArgs; self.lock = root.lock;
+            self.contextual = root.contextual; self.autowired = root.autowired; self.noArgs = root.noArgs; self.callPlans = root.callPlans; self.lock = root.lock;
             self.root = root;
             self.scopedValues = null;                             // made by the first scoped value
         }
@@ -431,6 +465,7 @@ namespace apogee {
         }
         // Forgets every build plan (bindings changed, so another constructor may fit).
         private fn dropPlans() {
+            self.callPlans.clear();
             self.bindings.forEach(fn(k: string, b: Binding) { b.planState.set(0); b.plan = null; });
             self.autowired.forEach(fn(k: string, b: Binding) { b.planState.set(0); b.plan = null; });
         }
