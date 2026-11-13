@@ -104,6 +104,19 @@ test "contextual bindings, extenders, resolving hooks, aliases, tags" {
     assertEq(c.tagged("timers").size(), 2);
 }
 
+test "base-type hooks, and values a scope provides are injectable" {
+    let c = base();
+    let seen = new Array<string>();
+    c.afterResolvingAny::<Store>(fn(s: Store, c: Container) { seen.push(s.name()); });
+    c.afterResolvingAny::<Auditor>(fn(a: Auditor, c: Container) { seen.push("auditor"); });
+    c.make::<Reporter>();                                          // a Reporter is an Auditor, and needs a Store
+    assertEq(Str.join(seen, ","), "memory,auditor");
+    let s = c.scope();
+    s.provide::<Counter>(new Counter());
+    assertEq(s.hasNamed(nameof(Counter)), true);
+    assertEq(c.hasNamed(nameof(Counter)), false);
+}
+
 test "method injection: classes from the container, the rest in order" {
     let c = base();
     let g = new Greeter();

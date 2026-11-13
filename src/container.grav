@@ -50,6 +50,13 @@ namespace apogee {
         }
     }
 
+    // A hook for every value of some base type (afterResolvingAny).
+    class TypeHook {
+        public matches: fn(any) -> bool
+        public run: fn(any, Container)
+        constructor(matches: fn(any) -> bool, run: fn(any, Container)) { self.matches = matches; self.run = run; }
+    }
+
     // How to call a method: the key for each parameter the container fills
     // ("" for one the caller gives).
     class CallPlan {
@@ -100,6 +107,8 @@ namespace apogee {
         private autowired: HashMap<string, Binding>
         // Shared, never changed: the arguments of a constructor that takes none.
         private noArgs: Array<any>
+        // afterResolvingAny's hooks, tried on every value made.
+        private typeHooks: Array<TypeHook>
         // call()'s plans, by "Class.method".
         private callPlans: HashMap<string, CallPlan>
         private lock: ReentrantLock
@@ -119,6 +128,7 @@ namespace apogee {
             self.autowired = new HashMap<string, Binding>();
             self.noArgs = new Array<any>();
             self.callPlans = new HashMap<string, CallPlan>();
+            self.typeHooks = new Array<TypeHook>();
             self.lock = new ReentrantLock();
             self.root = null;
             self.scopedValues = new HashMap<string, any>();
@@ -174,6 +184,16 @@ namespace apogee {
             let list = t.resolvingHooks.getOr(nameof(T), null);
             if (list == null) { list = new Array<fn(any, Container)>(); t.resolvingHooks.put(nameof(T), list); }
             list.push(wrapped);
+            t.lock.unlock();
+            return self;
+        }
+        // `f` sees every value made that is a T (a subclass, or a class
+        // implementing interface T): base-type hooks, such as validating every
+        // form request as it is resolved.
+        fn afterResolvingAny<T>(f: fn(T, Container)) -> Container {
+            let t = self.top();
+            t.lock.lock();
+            t.typeHooks.push(new TypeHook(fn(v: any) -> bool { return v is T; }, fn(v: any, c: Container) { f(v as T, c); }));
             t.lock.unlock();
             return self;
         }
@@ -239,6 +259,7 @@ namespace apogee {
         fn makeNamed(key: string) -> any { return self.resolve(key, "", null); }
         fn hasNamed(key: string) -> bool {
             let k = self.real(key);
+            if (self.root != null && self.scopedValues != null && self.scopedValues.containsKey(k)) { return true; }   // provided here
             return self.top().bindings.containsKey(k) || ClassInfo.forName(k) != null;
         }
         fn boundNamed(key: string) -> bool { return self.top().bindings.containsKey(self.real(key)); }
@@ -306,7 +327,7 @@ namespace apogee {
         constructor(root: Container) {
             self.bindings = root.bindings; self.aliases = root.aliases; self.tags = root.tags;
             self.extenders = root.extenders; self.resolvingHooks = root.resolvingHooks;
-            self.contextual = root.contextual; self.autowired = root.autowired; self.noArgs = root.noArgs; self.callPlans = root.callPlans; self.lock = root.lock;
+            self.contextual = root.contextual; self.autowired = root.autowired; self.noArgs = root.noArgs; self.callPlans = root.callPlans; self.typeHooks = root.typeHooks; self.lock = root.lock;
             self.root = root;
             self.scopedValues = null;                             // made by the first scoped value
         }
@@ -419,6 +440,7 @@ namespace apogee {
                 let hooks = t.resolvingHooks.getOr(key, null);
                 if (hooks != null) { for (h in hooks) { h(v, self); } }
             }
+            if (t.typeHooks.size() > 0) { for (h in t.typeHooks) { if (h.matches(v)) { h.run(v, self); } } }
             return v;
         }
         private fn construct(b: Binding, given: Array<string>) -> any {
