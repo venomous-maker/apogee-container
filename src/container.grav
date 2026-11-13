@@ -1,0 +1,459 @@
+// container.grav — dependency injection: bind what a type means once, then ask
+// for it anywhere; classes are built by wiring their constructors' parameters.
+//
+//   let c = new Container()
+//   c.singleton::<Mailer>(fn(c: Container) -> Mailer { return new SmtpMailer(Config.getString("mail.host")) })
+//   c.bindClass::<UserRepository, SqlUserRepository>()      // an interface to a class, autowired
+//   c.scoped::<RequestContext>(fn(c: Container) -> RequestContext { return new RequestContext() })
+//   let users = c.make::<UserService>()                     // built: its constructor's
+//                                                           // UserRepository and Mailer resolved
+//   let req = c.scope()                                     // one per request: its own scoped values
+//
+// Keys are types (nameof(T): interfaces too) or plain names. A type nobody
+// bound but that has reflection is autowired: the constructor with the most
+// parameters that can all be resolved is used, and the plan is remembered,
+// so the next build does no reflection lookups.
+//
+// Lifetimes: transient (bind: a new value each time), singleton (one for the
+// container and every scope of it, made on first use, under a lock, exactly
+// once), scoped (one per scope()), and instance (one given value).
+// A resolved singleton is read with no lock at all.
+import "std"
+
+namespace apogee {
+
+    // A key that cannot be resolved, a dependency cycle, or a bad binding.
+    class ContainerError extends Exception {
+        constructor(message: string) { super(message); }
+        public fn kind() -> string { return "ContainerError"; }
+    }
+
+    enum Lifetime { Transient, Singleton, Scoped }
+
+    // What one key resolves to.
+    class Binding {
+        public key: string
+        public lifetime: Lifetime
+        // Makes the value; null when `cls` is autowired instead.
+        public factory: fn(Container) -> any
+        public cls: ClassInfo
+        // A singleton's value once made: `ready` (1) is set after `value`, so a
+        // reader that sees it needs no lock.
+        public value: any
+        public ready: AtomicInt
+        // An autowired class's build plan once worked out (2: `plan` is set).
+        public plan: BuildPlan
+        public planState: AtomicInt
+        constructor(key: string, lifetime: Lifetime) {
+            self.key = key; self.lifetime = lifetime; self.factory = null; self.cls = null;
+            self.value = null; self.ready = new AtomicInt(0); self.plan = null; self.planState = new AtomicInt(0);
+        }
+    }
+
+    // How to build a class: which constructor, and the key for each parameter.
+    class BuildPlan {
+        public cls: ClassInfo
+        public ctorParams: int
+        public keys: Array<string>
+        constructor(cls: ClassInfo, ctorParams: int, keys: Array<string>) { self.cls = cls; self.ctorParams = ctorParams; self.keys = keys; }
+    }
+
+    // A lock its holder may take again (a singleton's factory resolving
+    // another singleton).
+    class ReentrantLock {
+        private m: Mutex
+        private owner: AtomicInt
+        private depth: int
+        constructor() { self.m = new Mutex(); self.owner = new AtomicInt(0); self.depth = 0; }
+        fn lock() {
+            let me = Thread.currentId();
+            if (self.owner.get() == me) { self.depth += 1; return; }
+            self.m.lock();
+            self.owner.set(me);
+            self.depth = 1;
+        }
+        fn unlock() {
+            self.depth -= 1;
+            if (self.depth == 0) { self.owner.set(0); self.m.unlock(); }
+        }
+    }
+
+    class Container {
+        // ── the root's (shared by its scopes) ──────────────────────────────────
+        private bindings: HashMap<string, Binding>
+        private aliases: HashMap<string, string>
+        private tags: HashMap<string, Array<string>>
+        private extenders: HashMap<string, Array<fn(any, Container) -> any>>
+        private resolvingHooks: HashMap<string, Array<fn(any, Container)>>
+        // "consumer|dependency" -> what the consumer gets for that dependency.
+        private contextual: HashMap<string, fn(Container) -> any>
+        // Classes autowired without a binding, by name (under `lock`).
+        private autowired: HashMap<string, Binding>
+        // Shared, never changed: the arguments of a constructor that takes none.
+        private noArgs: Array<any>
+        private lock: ReentrantLock
+        // ── this container's own ───────────────────────────────────────────────
+        // The root container (itself for the root).
+        private root: Container
+        // Scoped values made in this scope (a scope belongs to one thread at a time).
+        private scopedValues: HashMap<string, any>
+
+        constructor() {
+            self.bindings = new HashMap<string, Binding>();
+            self.aliases = new HashMap<string, string>();
+            self.tags = new HashMap<string, Array<string>>();
+            self.extenders = new HashMap<string, Array<fn(any, Container) -> any>>();
+            self.resolvingHooks = new HashMap<string, Array<fn(any, Container)>>();
+            self.contextual = new HashMap<string, fn(Container) -> any>();
+            self.autowired = new HashMap<string, Binding>();
+            self.noArgs = new Array<any>();
+            self.lock = new ReentrantLock();
+            self.root = null;
+            self.scopedValues = new HashMap<string, any>();
+            let me = self;
+            self.instanceNamed(nameof(Container), me);
+        }
+        private fn top() -> Container { return self.root == null ? self : self.root; }
+
+        // ── binding by type ────────────────────────────────────────────────────
+        // A new value from `f` each time T is asked for.
+        fn bind<T>(f: fn(Container) -> T) -> Container { return self.bindNamed(nameof(T), Container.erase::<T>(f), Lifetime.Transient); }
+        // One value from `f`, made the first time T is asked for.
+        fn singleton<T>(f: fn(Container) -> T) -> Container { return self.bindNamed(nameof(T), Container.erase::<T>(f), Lifetime.Singleton); }
+        // One value from `f` per scope().
+        fn scoped<T>(f: fn(Container) -> T) -> Container { return self.bindNamed(nameof(T), Container.erase::<T>(f), Lifetime.Scoped); }
+        // `value` itself, whenever T is asked for.
+        fn instance<T>(value: T) -> Container { return self.instanceNamed(nameof(T), value); }
+        // T (an interface or base class) means C, autowired: a new one each time.
+        fn bindClass<T, C>() -> Container { return self.bindClassNamed(nameof(T), reflect(C), Lifetime.Transient); }
+        fn singletonClass<T, C>() -> Container { return self.bindClassNamed(nameof(T), reflect(C), Lifetime.Singleton); }
+        fn scopedClass<T, C>() -> Container { return self.bindClassNamed(nameof(T), reflect(C), Lifetime.Scoped); }
+        // Makes class C known (autowired, a new one each time), so a constructor
+        // that takes a C can be wired.
+        fn register<C>() -> Container { return self.bindClassNamed(nameof(C), reflect(C), Lifetime.Transient); }
+        // C as a singleton under its own name.
+        fn registerSingleton<C>() -> Container { return self.bindClassNamed(nameof(C), reflect(C), Lifetime.Singleton); }
+        // When building `Consumer`, its `Dependency` parameter gets `f`'s value
+        // (other classes still get the ordinary binding).
+        fn when<Consumer, Dependency>(f: fn(Container) -> Dependency) -> Container {
+            let t = self.top();
+            t.lock.lock();
+            t.contextual.put(nameof(Consumer) + "|" + nameof(Dependency), Container.erase::<Dependency>(f));
+            t.dropPlans();
+            t.lock.unlock();
+            return self;
+        }
+        // Every T made from here on goes through `f` (which may wrap or replace it).
+        fn extend<T>(f: fn(T, Container) -> T) -> Container {
+            let wrapped = fn(v: any, c: Container) -> any { return f(v as T, c); };
+            let t = self.top();
+            t.lock.lock();
+            let list = t.extenders.getOr(nameof(T), null);
+            if (list == null) { list = new Array<fn(any, Container) -> any>(); t.extenders.put(nameof(T), list); }
+            list.push(wrapped);
+            t.lock.unlock();
+            return self;
+        }
+        // `f` sees every T as it is made (after extenders).
+        fn resolving<T>(f: fn(T, Container)) -> Container {
+            let wrapped = fn(v: any, c: Container) { f(v as T, c); };
+            let t = self.top();
+            t.lock.lock();
+            let list = t.resolvingHooks.getOr(nameof(T), null);
+            if (list == null) { list = new Array<fn(any, Container)>(); t.resolvingHooks.put(nameof(T), list); }
+            list.push(wrapped);
+            t.lock.unlock();
+            return self;
+        }
+        // Adds T to the group `tag` (tagged(tag) makes every member).
+        fn tag<T>(tag: string) -> Container { return self.tagNamed(nameof(T), tag); }
+
+        // ── binding by name ────────────────────────────────────────────────────
+        fn bindNamed(key: string, f: fn(Container) -> any, lifetime: Lifetime) -> Container {
+            let b = new Binding(key, lifetime);
+            b.factory = f;
+            return self.put(b);
+        }
+        fn instanceNamed(key: string, value: any) -> Container {
+            let b = new Binding(key, Lifetime.Singleton);
+            b.value = value;
+            b.ready.set(1);
+            return self.put(b);
+        }
+        fn bindClassNamed(key: string, cls: ClassInfo, lifetime: Lifetime) -> Container {
+            if (cls == null) { throw new ContainerError("no class to bind " + key + " to"); }
+            let b = new Binding(key, lifetime);
+            b.cls = cls;
+            self.put(b);
+            if (cls.name != key && !self.top().bindings.containsKey(cls.name)) {
+                let own = new Binding(cls.name, Lifetime.Transient);
+                own.cls = cls;
+                self.put(own);
+            }
+            return self;
+        }
+        // `name` means whatever `target` means (both keys).
+        fn alias(name: string, target: string) -> Container {
+            let t = self.top();
+            t.lock.lock();
+            t.aliases.put(name, target);
+            t.lock.unlock();
+            return self;
+        }
+        fn tagNamed(key: string, tag: string) -> Container {
+            let t = self.top();
+            t.lock.lock();
+            let list = t.tags.getOr(tag, null);
+            if (list == null) { list = new Array<string>(); t.tags.put(tag, list); }
+            if (!list.contains(key)) { list.push(key); }
+            t.lock.unlock();
+            return self;
+        }
+        private fn put(b: Binding) -> Container {
+            let t = self.top();
+            t.lock.lock();
+            t.bindings.put(b.key, b);
+            t.dropPlans();
+            t.lock.unlock();
+            return self;
+        }
+
+        // ── resolving ──────────────────────────────────────────────────────────
+        fn make<T>() -> T { return self.makeNamed(nameof(T)) as T; }
+        // Whether T can be resolved (bound, an alias of something bound, or
+        // autowirable).
+        fn has<T>() -> bool { return self.hasNamed(nameof(T)); }
+        fn bound<T>() -> bool { return self.boundNamed(nameof(T)); }
+        fn makeNamed(key: string) -> any { return self.resolve(key, "", null); }
+        fn hasNamed(key: string) -> bool {
+            let k = self.real(key);
+            return self.top().bindings.containsKey(k) || ClassInfo.forName(k) != null;
+        }
+        fn boundNamed(key: string) -> bool { return self.top().bindings.containsKey(self.real(key)); }
+        // A new object of `cls`, its constructor wired (whatever cls is bound to).
+        fn build(cls: ClassInfo) -> any { return self.construct(self.autowire(cls.name, cls, null), null); }
+        // Every member of the group `tag`, resolved, in the order they were tagged.
+        fn tagged(tag: string) -> Array<any> {
+            let out = new Array<any>();
+            let keys = self.top().tags.getOr(tag, null);
+            if (keys != null) { for (k in keys) { out.push(self.makeNamed(k)); } }
+            return out;
+        }
+        // Calls `method` on `obj` with each parameter resolved by its type, the
+        // ones that are not classes taken in order from `extra` (route values,
+        // say): method injection, as controllers use.
+        fn call(obj: any, method: string, extra: Array<any> = new Array<any>()) -> any {
+            let info = ClassInfo.of(obj);
+            if (info == null) { throw new ContainerError("call: not an object"); }
+            if (!info.isReflected()) {
+                throw new ContainerError("call: " + info.name + " has no reflection (name it in reflect(...) or give its hierarchy a decorator)");
+            }
+            let m = info.method(method);
+            if (m == null) { throw new ContainerError(info.name + " has no method '" + method + "'"); }
+            let args = new Array<any>();
+            let next = 0;
+            for (p in Container.splitTypes(m.params)) {
+                let k = self.keyFor(p);
+                if (k != "" && self.hasNamed(k)) { args.push(self.makeNamed(k)); }
+                else if (next < extra.size()) { args.push(extra[next]); next += 1; }
+                else { throw new ContainerError("cannot call " + info.name + "." + method + ": nothing for its " + p + " parameter"); }
+            }
+            return m.invoke(obj, args);
+        }
+
+        // ── scopes ─────────────────────────────────────────────────────────────
+        // A child for one unit of work (a request, a job): it shares the
+        // bindings and singletons, and keeps scoped values of its own.
+        fn scope() -> Container {
+            let child = new Container(self.top());
+            return child;
+        }
+        // (scope()'s: a child sharing `root`'s bindings.)
+        constructor(root: Container) {
+            self.bindings = root.bindings; self.aliases = root.aliases; self.tags = root.tags;
+            self.extenders = root.extenders; self.resolvingHooks = root.resolvingHooks;
+            self.contextual = root.contextual; self.autowired = root.autowired; self.noArgs = root.noArgs; self.lock = root.lock;
+            self.root = root;
+            self.scopedValues = null;                             // made by the first scoped value
+        }
+        // Forgets T's binding and its made value.
+        fn forget<T>() { self.forgetNamed(nameof(T)); }
+        fn forgetNamed(key: string) {
+            let t = self.top();
+            t.lock.lock();
+            t.bindings.remove(key);
+            t.dropPlans();
+            t.lock.unlock();
+            if (self.scopedValues != null) { self.scopedValues.remove(key); }
+        }
+        // Drops every singleton value made so far (they are made again on next use).
+        fn resetSingletons() {
+            let t = self.top();
+            t.lock.lock();
+            t.bindings.forEach(fn(k: string, b: Binding) { if (b.factory != null || b.cls != null) { b.ready.set(0); b.value = null; } });
+            t.lock.unlock();
+        }
+
+        // ── the work ───────────────────────────────────────────────────────────
+        private fn real(key: string) -> string {
+            let k = key;
+            let aliases = self.top().aliases;
+            for (i in 0..16) {                                    // (alias chains, bounded)
+                if (!aliases.containsKey(k)) { return k; }
+                k = aliases[k];
+            }
+            throw new ContainerError("alias loop at " + key);
+        }
+        private fn resolve(key: string, consumer: string, path: Array<string>) -> any {
+            let t = self.top();
+            let k = t.aliases.size() == 0 ? key : self.real(key);
+            if (self.root != null) {                                          // a scope: itself, and its own values
+                if (k == nameof(Container)) { return self; }
+                if (self.scopedValues != null && self.scopedValues.containsKey(k)) { return self.scopedValues[k]; }
+            }
+            if (consumer != "" && t.contextual.size() > 0) {
+                let f = t.contextual.getOr(consumer + "|" + k, null);
+                if (f != null) { return f(self); }
+            }
+            let b = t.bindings.getOr(k, null);
+            if (b == null) { b = self.autowire(k, null, path); }
+            if (b.lifetime == Lifetime.Singleton) {
+                if (b.ready.get() == 1) { return b.value; }                   // the lock-free path
+                t.lock.lock();
+                try {
+                    if (b.ready.get() == 0) {
+                        b.value = self.finish(k, self.produce(b, path));
+                        b.ready.set(1);
+                    }
+                } finally { t.lock.unlock(); }
+                return b.value;
+            }
+            if (b.lifetime == Lifetime.Scoped) {
+                if (self.root == null) { throw new ContainerError(k + " is scoped: resolve it from a scope() (one per request or job)"); }
+                let v = self.finish(k, self.produce(b, path));
+                if (self.scopedValues == null) { self.scopedValues = new HashMap<string, any>(); }
+                self.scopedValues.put(k, v);
+                return v;
+            }
+            return self.finish(k, self.produce(b, path));
+        }
+        // The binding for a class nobody bound but that reflection can find
+        // (made once, then remembered).
+        private fn autowire(k: string, cls: ClassInfo, path: Array<string>) -> Binding {
+            let t = self.top();
+            t.lock.lock();
+            let b = t.autowired.getOr(k, null);
+            if (b == null) {
+                let c = cls != null ? cls : ClassInfo.forName(k);
+                if (c != null) {
+                    b = new Binding(k, Lifetime.Transient);
+                    b.cls = c;
+                    t.autowired.put(k, b);
+                }
+            }
+            t.lock.unlock();
+            if (b == null) {
+                throw new ContainerError("nothing is bound to " + k + Container.describePath(path) +
+                    ": bind it, or give the class reflection (register::<C>() or a decorator)");
+            }
+            return b;
+        }
+        private fn produce(b: Binding, path: Array<string>) -> any {
+            if (b.factory != null) { return b.factory(self); }
+            return self.construct(b, path);
+        }
+        // Applies extenders and resolving hooks.
+        private fn finish(key: string, v: any) -> any {
+            let t = self.top();
+            if (t.extenders.size() > 0) {
+                let ext = t.extenders.getOr(key, null);
+                if (ext != null) { for (f in ext) { v = f(v, self); } }
+            }
+            if (t.resolvingHooks.size() > 0) {
+                let hooks = t.resolvingHooks.getOr(key, null);
+                if (hooks != null) { for (h in hooks) { h(v, self); } }
+            }
+            return v;
+        }
+        private fn construct(b: Binding, given: Array<string>) -> any {
+            let cls = b.cls;
+            let path = given == null ? new Array<string>() : given;
+            if (path.contains(cls.name)) { throw new ContainerError("dependency cycle: " + Str.join(path, " -> ") + " -> " + cls.name); }
+            let plan = self.planFor(b, path);
+            let n = plan.keys.size();
+            if (n == 0) { return cls.create(self.top().noArgs); }
+            let args = new Array<any>();
+            args.reserve(n);
+            path.push(cls.name);                     // (a failed build abandons the whole path: no finally needed)
+            for (k in plan.keys) { args.push(self.resolve(k, cls.name, path)); }
+            path.pop();
+            return cls.create(args);
+        }
+        // The binding's remembered plan, or a new one: the constructor with the
+        // most parameters that can all be resolved.
+        private fn planFor(b: Binding, path: Array<string>) -> BuildPlan {
+            if (b.planState.get() == 2) { return b.plan; }
+            let cls = b.cls;
+            let t = self.top();
+            let best: BuildPlan = null;
+            let tried = new Array<string>();
+            for (ctor in cls.constructors()) {
+                if (!ctor.canInvoke()) { continue; }
+                let keys = new Array<string>();
+                let ok = true;
+                for (p in Container.splitTypes(ctor.params)) {
+                    let k = self.keyFor(p);
+                    let ctx = t.contextual.containsKey(cls.name + "|" + k);
+                    if (k == "" || (!ctx && !self.hasNamed(k))) { ok = false; tried.push("(" + ctor.params + ")"); break; }
+                    keys.push(k);
+                }
+                if (ok && (best == null || keys.size() > best.keys.size())) { best = new BuildPlan(cls, keys.size(), keys); }
+            }
+            if (best == null) {
+                throw new ContainerError("cannot build " + cls.name + Container.describePath(path) +
+                    (tried.size() == 0 ? ": it has no constructor reflection can call"
+                                       : ": no constructor's parameters can all be resolved, tried " + Str.join(tried, ", ")));
+            }
+            if (b.planState.compareAndSet(0, 1)) { b.plan = best; b.planState.set(2); }   // the first to finish keeps it
+            return best;
+        }
+        // Forgets every build plan (bindings changed, so another constructor may fit).
+        private fn dropPlans() {
+            self.bindings.forEach(fn(k: string, b: Binding) { b.planState.set(0); b.plan = null; });
+            self.autowired.forEach(fn(k: string, b: Binding) { b.planState.set(0); b.plan = null; });
+        }
+        // The key for a parameter type as reflection writes it: a class or
+        // interface name as it is ("" for one that cannot be injected: numbers,
+        // strings, functions, nullable values).
+        private fn keyFor(typeName: string) -> string {
+            let t = Str.trim(typeName);
+            if (t == "" || Str.endsWith(t, "?") || Str.startsWith(t, "fn") || Str.indexOf(t, "(") >= 0) { return ""; }
+            switch (t) {
+                case "int", "long", "uint", "ulong", "byte", "float", "double", "bool", "string", "any", "binary": return ""
+                default: return t
+            }
+        }
+        // "Repo, HashMap<string, any>, int" -> each type (commas inside <> kept).
+        static fn splitTypes(list: string) -> Array<string> {
+            let out = new Array<string>();
+            if (Str.trim(list) == "") { return out; }
+            let depth = 0;
+            let start = 0;
+            for (i in 0..list.length) {
+                let c = list[i] as int;
+                if (c == 60 || c == 40) { depth += 1; }
+                else if (c == 62 || c == 41) { depth -= 1; }
+                else if (c == 44 && depth == 0) { out.push(Str.trim(list[start..i])); start = i + 1; }
+            }
+            out.push(Str.trim(list[start..]));
+            return out;
+        }
+        private static fn describePath(path: Array<string>) -> string {
+            return path == null || path.size() == 0 ? "" : " (needed by " + Str.join(path, " -> ") + ")";
+        }
+        // A typed factory as one that returns any.
+        private static fn erase<T>(f: fn(Container) -> T) -> fn(Container) -> any {
+            return fn(c: Container) -> any { return f(c); };
+        }
+    }
+}
