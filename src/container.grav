@@ -276,6 +276,15 @@ namespace apogee {
             self.root = root;
             self.scopedValues = null;                             // made by the first scoped value
         }
+        // `value` for T in this scope only (the request a scope serves, say):
+        // the root and other scopes are not affected.
+        fn provide<T>(value: T) -> Container { return self.provideNamed(nameof(T), value); }
+        fn provideNamed(key: string, value: any) -> Container {
+            if (self.root == null) { throw new ContainerError("provide() is for a scope(): on the root, use instance()"); }
+            if (self.scopedValues == null) { self.scopedValues = new HashMap<string, any>(); }
+            self.scopedValues.put(key, value);
+            return self;
+        }
         // Forgets T's binding and its made value.
         fn forget<T>() { self.forgetNamed(nameof(T)); }
         fn forgetNamed(key: string) {
