@@ -1,0 +1,5 @@
+name = "apogee-container"
+lib = "src/container.grav"
+paths = ["src"]
+
+[dependencies]
