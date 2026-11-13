@@ -123,6 +123,13 @@ test "scopes: scoped values per scope, singletons shared" {
     assertEq(s1.make::<Counter>() == s2.make::<Counter>(), false);
     assertEq(s1.make::<Store>() == s2.make::<Store>(), true);
     assertEq(s1.make::<Container>() == s1, true);
+    let mine = new Counter();
+    s1.provide::<Counter>(mine);
+    assertEq(s1.make::<Counter>() == mine, true);
+    assertEq(s2.make::<Counter>() == mine, false);
+    let msg2 = "";
+    try { c.provide::<Counter>(mine); } catch (e: ContainerError) { msg2 = e.message(); }
+    assertEq(Str.contains(msg2, "is for a scope()"), true);
 }
 
 test "errors: nothing bound, primitives, cycles" {
