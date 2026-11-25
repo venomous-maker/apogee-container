@@ -4,7 +4,7 @@ Dependency injection for [Apogee](https://github.com/venomous-maker): bind
 what a type means once, then ask for it anywhere. Classes are built by wiring
 their constructors' parameters, interfaces included.
 
-```grav
+```typescript
 import "std"
 import "apogee-container"
 
